@@ -247,37 +247,59 @@ mhost *member_get(struct in_addr *addr)
 mhost *member_add(struct in_addr *addr, mdata *data)
 {
   int f = 0;
-  int l = 0;
   mping *p = NULL;
   mhost *t = member_get(addr);
 
   if(!t){
     f = 1;
-    t = malloc(sizeof(mhost));
+    t = calloc(1, sizeof(mhost));
     if(!t){
       lprintf(0, "%s: out of memory\n", __func__);
       return(NULL);
     }
-    memset(t, 0, sizeof(mhost));
     memcpy(&t->ad, addr, sizeof(t->ad));
     if(members){
       members->prev = t;
       t->next = members;
     }
     members = t;
-    t->hostname[0] = 0;
   }
   if(data){
     if(data->head.opcode == MAKUO_OP_PING){
+      unsigned int maxlen;
+      if(data->head.szdata < sizeof(mping)){
+        lprintf(0, "[error] %s: illegal data size\n", __func__);
+        if(f) {
+          free(t);
+        }
+        return(NULL);
+      }
       p = (mping *)data->data;
-      l = ntohs(p->hostnamelen);
+      p->hostnamelen = ntohs(p->hostnamelen);
+      p->versionlen = ntohs(p->versionlen);
+      if(p->hostnamelen + p->versionlen != data->head.szdata - sizeof(mping)){
+        lprintf(0, "[error] %s: illegal mping size: hostnamelen: %uh, versionlen: %uh, head.szdata: %uh\n", __func__, p->hostnamelen, p->versionlen, data->head.szdata);
+        if(f) {
+          free(t);
+        }
+        return(NULL);
+      }
+      maxlen = p->hostnamelen;
+      if(maxlen >= sizeof(t->hostname)){
+        maxlen = sizeof(t->hostname) - 1;
+        lprintf(1, "[warning] %s: hostnamelen(len:%uh) is overflow (sizeof(mhost.hostname): %z)\n", __func__, p->hostnamelen, sizeof(t->hostname));
+      }
       data->p = p->data;
-      memcpy(t->hostname, data->p, l);
-      t->hostname[l] = 0;
-      data->p += l;
-      l = ntohs(p->versionlen);
-      memcpy(t->version,  data->p, l);
-      t->version[l] = 0;
+      memcpy(t->hostname, data->p, maxlen);
+      t->hostname[maxlen] = 0;
+      data->p += p->hostnamelen;
+      maxlen = p->versionlen;
+      if(maxlen >= sizeof(t->version)){
+        maxlen = sizeof(t->version) - 1;
+        lprintf(1, "[warning] %s: versiolen(len:%uh) is overflow (sizeof(mhost.version): %z)\n", __func__, p->versionlen, sizeof(t->version));
+      }
+      memcpy(t->version,  data->p, maxlen);
+      t->version[maxlen] = 0;
     }
   }
   if(f){

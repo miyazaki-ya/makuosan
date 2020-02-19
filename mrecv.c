@@ -70,7 +70,7 @@ static int mrecv_decrypt(mdata *data, struct sockaddr_in *addr)
 
 static int mrecv_packet(int s, mdata *data, struct sockaddr_in *addr)
 {
-  int recvsize;
+  ssize_t recvsize;
   socklen_t addr_len;
 
   while(1){
@@ -101,6 +101,10 @@ static int mrecv_packet(int s, mdata *data, struct sockaddr_in *addr)
     data->head.maddr  = data->head.maddr;
     data->head.mport  = data->head.mport;
     data->head.error  = ntohl(data->head.error);
+    if(recvsize < sizeof(data->head) + data->head.szdata) {
+      lprintf(0, "[error] %s: recv data size error from %s\n", __func__, inet_ntoa(addr->sin_addr));
+      return(-1);
+    }
     if(data->head.maddr != moption.maddr.sin_addr.s_addr){
       continue; /* other group packet */
     }
@@ -385,7 +389,10 @@ static void mrecv_req_ping(mdata *data, struct sockaddr_in *addr)
   mping *p;
   mfile *a;
   char buff[MAKUO_HOSTNAME_MAX + 1];
-  member_add(&addr->sin_addr, data);
+  if(!member_add(&addr->sin_addr, data)){
+    /* no mem or illegal data */
+    return;
+  }
   a = mkack(data, addr, MAKUO_RECVSTATE_NONE);
   if(gethostname(buff, sizeof(buff)) == -1){
     buff[0] = 0;
