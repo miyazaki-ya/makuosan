@@ -4,9 +4,16 @@
  */
 #include "makuosan.h"
 #include <openssl/md5.h>
+#include "hashtable.h"
 
 static void mrecv_req(mdata *data, struct sockaddr_in *addr);
 static void mrecv_ack(mdata *data, struct sockaddr_in *addr);
+
+#define MHOST_TABLE_SZ 521
+#define MHEAD_TABLE_SZ 1031
+
+static int init_host_digest_elem(mhost *host);
+static void clean_mhost_hash(void);
 
 /******************************************************************
 *
@@ -186,7 +193,10 @@ static void mrecv_ack_report(mfile *m, mhost *t, mdata *data)
 
 static void mrecv_ack_ping(mdata *data, struct sockaddr_in *addr)
 {
-  member_add(&addr->sin_addr, data);
+  mhost *t = member_add(&addr->sin_addr, data);
+  if(t){
+    init_host_digest_elem(t);
+  }
 }
 
 static void mrecv_ack_send_mark(mdata *data, mfile *m, mhost *t)
@@ -1422,7 +1432,201 @@ void mrecv_gc()
 void mrecv_clean()
 {
   mfile *m = mftop[MFRECV];
+  clean_mhost_hash();
   while((m = mrecv_mfdel(m)));
+}
+
+static hash_table *mhost_hash = NULL;
+static int mdata_exists_dummy_value = 1;
+
+static unsigned int mhost_hash_key(const unsigned int hash_table_sz, const size_t keysz, const void *key)
+{
+  mhost *m;
+  unsigned int i;
+  unsigned int r = 0;
+  if(keysz != sizeof(mhost)){
+    return 0;
+  }
+  m = (mhost *)key;
+  for(i = 0; i < MAKUO_HOSTNAME_MAX; i++){
+    char c = m->hostname[i];
+    if(!c) {
+      break;
+    }
+    r += (unsigned int)c;
+  }
+  for(i = 0; i < 32; i++){
+    char c = m->version[i];
+    if(!c){
+      break;
+    }
+    r += (unsigned int)c;
+  }
+  r += (unsigned int)( m->ad.s_addr        & 0x000000ff);
+  r += (unsigned int)((m->ad.s_addr >>  8) & 0x000000ff);
+  r += (unsigned int)((m->ad.s_addr >> 16) & 0x000000ff);
+  r += (unsigned int)((m->ad.s_addr >> 24) & 0x000000ff);
+  return(r % hash_table_sz);
+}
+
+static int mhost_key_cmp(const size_t a_sz, const void *a, const size_t b_sz, const void *b)
+{
+  if(a_sz < b_sz){
+    return(-1);
+  }else if(a_sz > b_sz){
+    return(1);
+  }else if(a_sz != sizeof(mhost)){
+    return(memcmp(a, b, a_sz));
+  }else{
+    mhost *ma = (mhost *)a;
+    mhost *mb = (mhost *)b;
+    int r;
+    r = strncmp(ma->hostname, mb->hostname, MAKUO_HOSTNAME_MAX);
+    if(r != 0){
+      return(r);
+    }
+    r = strncmp(ma->version, mb->version, 32);
+    if(r != 0){
+      return(r);
+    }
+    if(ma->ad.s_addr > mb->ad.s_addr){
+      return(1);
+    }else if(ma->ad.s_addr < mb->ad.s_addr){
+      return(-1);
+    }else{
+      return(0);
+    }
+  }
+}
+
+static void clean_mhead_hash(hash_table *mhead_hash)
+{
+  unsigned int keyslen;
+  unsigned int i;
+  get_keys_in_hash_table(mhead_hash, &keyslen, NULL);
+  if(keyslen){
+    hash_key_list *keys = calloc(keyslen, sizeof(hash_key_list));
+    if(keys){
+      get_keys_in_hash_table(mhead_hash, &keyslen, &keys);
+      for(i = 0; i < keyslen; i++){
+        if(keys[i].keysz){
+          void *r_key;
+          if(remove_value_from_hash_table(mhead_hash, keys[i].keysz, keys[i].key, &r_key, NULL)){
+            free(r_key);
+          }
+        }
+      }
+      free(keys);
+    }
+  }
+  delete_hash_table(mhead_hash);
+}
+
+static void clean_mhost_hash(void)
+{
+  unsigned int keyslen;
+  if(!mhost_hash){
+    return;
+  }
+  if(get_keys_in_hash_table(mhost_hash, &keyslen, NULL)){
+    if(keyslen){
+      hash_key_list *keys = calloc(keyslen, sizeof(hash_key_list));
+      if(keys){
+        if(get_keys_in_hash_table(mhost_hash, &keyslen, &keys)){
+          unsigned int i;
+          for(i = 0; i < keyslen; i++){
+            hash_table *mhead_hash;
+            get_value_from_hash_table(mhost_hash, keys[i].keysz, keys[i].key, NULL, (void **)(&mhead_hash));
+            remove_value_from_hash_table(mhost_hash, keys[i].keysz, keys[i].key, NULL, NULL);
+            clean_mhead_hash(mhead_hash);
+          }
+        }
+        free(keys);
+      }
+    }
+  }
+  delete_hash_table(mhost_hash);
+  mhost_hash = NULL;
+}
+
+static int init_host_digest_elem(mhost *host)
+{
+  hash_table *old_mhead_hash = NULL;
+  hash_table *new_mhead_hash;
+  if(!mhost_hash){
+    mhost_hash = create_hash_table(MHOST_TABLE_SZ, &mhost_hash_key, &mhost_key_cmp);
+    if(!mhost_hash){
+      return(ENOMEM);
+    }
+  }
+  if(exists_in_hash_table(mhost_hash, sizeof(mhost), host)){
+    get_value_from_hash_table(mhost_hash, sizeof(mhost), host, NULL, (void **)(&old_mhead_hash));
+  }
+  new_mhead_hash = create_hash_table(MHEAD_TABLE_SZ, NULL, NULL);
+  if(!new_mhead_hash){
+    return(ENOMEM);
+  }
+  set_value_to_hash_table(mhost_hash, sizeof(mhost), host, sizeof(hash_table *), new_mhead_hash, NULL, NULL);
+  if(old_mhead_hash){
+    clean_mhead_hash(old_mhead_hash);
+  }
+  return(1);
+}
+
+static int update_received_info(mhost *host, mdata *data)
+{
+  ssize_t mheadsz;
+  hash_table *mhost_h = NULL;
+  hash_table *mhead_hash = NULL;
+  mhead *key;
+  hash_table *mhead_temp_hash;
+  int created_mhead_temp_hash;
+  unsigned int keyslen;
+  void *old_key;
+
+  if(!mhost_hash){
+    mhost_hash = create_hash_table(MHOST_TABLE_SZ, &mhost_hash_key, &mhost_key_cmp);
+    if(!mhost_hash){
+      return(ENOMEM);
+    }
+  }
+  mhost_h = mhost_hash;
+  mheadsz = sizeof(mhead);
+  if(exists_in_hash_table(mhost_h, sizeof(mhost), host)){
+    get_value_from_hash_table(mhost_h, sizeof(mhost), host, NULL, (void **)(&mhead_hash));
+    if(exists_in_hash_table(mhead_hash, mheadsz, &(data->head))){
+      /* exists == duplicate  */
+      void *r_key;
+      if(remove_value_from_hash_table(mhead_hash, mheadsz, &(data->head), &r_key, NULL)){
+        free(r_key);
+      }
+      return(0);
+    }
+    mhead_temp_hash = mhead_hash;
+    created_mhead_temp_hash = 0;
+  }else{
+    mhead_temp_hash = create_hash_table(MHEAD_TABLE_SZ, NULL, NULL);
+    if(!mhead_temp_hash){
+      return(ENOMEM);
+    }
+    created_mhead_temp_hash = 1;
+  }
+  key = calloc(1, mheadsz);
+  if(!key){
+    if(created_mhead_temp_hash == 1){
+      delete_hash_table(mhead_temp_hash);
+    }
+    return(ENOMEM);
+  }
+  memcpy(key, &(data->head), mheadsz);
+  if(set_value_to_hash_table(mhead_temp_hash, mheadsz, key, sizeof(int), &mdata_exists_dummy_value, &old_key, NULL) == 2){
+    free(old_key);
+  }
+  get_keys_in_hash_table(mhead_temp_hash, &keyslen, NULL);
+  if(created_mhead_temp_hash == 1){
+    set_value_to_hash_table(mhost_h, sizeof(mhost), host, sizeof(hash_table *), mhead_temp_hash, NULL, NULL);
+  }
+  return(1);
 }
 
 int mrecv()
@@ -1430,13 +1634,29 @@ int mrecv()
   mfile *m;
   mhost *t;
   mdata data;
+  int updated;
   struct sockaddr_in addr;
 
   m = mftop[MFSEND];
-  if(mrecv_packet(moption.mcsocket, &data, &addr) == -1){
-    return(0);
+  while(1){
+    if(mrecv_packet(moption.mcsocket, &data, &addr) == -1){
+      return(0);
+    }
+    t = member_get(&addr.sin_addr);
+    if(!t){
+      break;
+    }
+    updated = update_received_info(t, &data);
+    if(updated < 0){
+      return(0);
+    }else if(updated == 0){
+      lprintf(0, "%s: probably duplicated packet. skip.\n", __func__);
+      continue;
+    }else{
+      break;
+    }
   }
-  if((t = member_get(&addr.sin_addr))){
+  if(t){
     mtimeget(&(t->lastrecv));
   }
   if(data.head.flags & MAKUO_FLAG_ACK){
